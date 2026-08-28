@@ -6,6 +6,9 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 from sentence_transformers import SentenceTransformer
+import numpy as np
+import time
+from google.genai import errors
 
 load_dotenv()
 
@@ -18,6 +21,30 @@ TRANSCRIPTIONS_PATH = "./transcriptions"
 CHUNKS_PATH = "./chunks/chunks.pkl"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+embed_model = SentenceTransformer(EMBED_MODEL)
+
+questions = [
+    "Who created FastAPI and is now building a cloud for it?",
+    "Datastar's whole pitch is that it's tiny. How tiny?",
+    "David Flood does digital humanities work at which university?",
+    "How many people sit on the Python Typing Council?",
+    "Which open source project is the million-line monorepo they tour?",
+    "Monty is a Python interpreter written in what language?",
+    "Before Zensical, Martin Donath was best known for which project?",
+    "Deep Agents comes from which company?",
+    "Compiled wheels are stuck targeting CPU features from roughly what year?",
+    "Tanya Janca is there to walk through which famous list?",
+    "Alex Kretzschmar is head of DevRel at which company?",
+    "Ray came out of which lab, at which university?",
+    "Chris May's go-to analogy for event sourcing is which version control system?",
+    "Rich Iannone and Michael Chow both work for which company?",
+    "Paolo's opening horror story is a pull request with how many lines added?",
+    "At PyCon, Startup Row lives in which part of the venue?",
+    "Which company acquired Astral?",
+    "Who replaced Brian Okken as co-host of Python Bytes?",
+    "Which city is Sumit Gundawar based in?",
+    "marimo pair puts a coding agent inside what, specifically?",
+]
 
 
 @dataclass
@@ -83,9 +110,8 @@ def chunk_text(content: str, path: Path) -> list[Chunk]:
     return chunks
 
 
-def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return embed_model.encode(texts).tolist()
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    return embed_model.encode(texts, normalize_embeddings=True).tolist()
 
 
 def extract_texts_from_chunks(chunks: list[Chunk]) -> list[str]:
@@ -104,12 +130,18 @@ def update_chunks_with_embeddings(
 
 
 def complete(prompt: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL_ID,
-        contents=prompt,
-        config=types.GenerateContentConfig(max_output_tokens=max_tokens),
-    )
-    return resp.text
+    for attempt in range(4):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL_ID,
+                contents=prompt,
+                config=types.GenerateContentConfig(max_output_tokens=max_tokens),
+            )
+            return resp.text
+        except errors.ServerError:
+            if attempt == 3:
+                raise
+            time.sleep(2**attempt)
 
 
 if __name__ == "__main__":
@@ -133,16 +165,53 @@ if __name__ == "__main__":
 
             for i in range(0, len(chunks), EMBED_CHUNK_SIZE):
                 temp_embeddings = embed_texts(
-                    extract_texts_from_chunks(chunks[i : i + EMBED_CHUNK_SIZE]),
-                    "RETRIEVAL_DOCUMENT",
+                    extract_texts_from_chunks(chunks[i : i + EMBED_CHUNK_SIZE])
                 )
                 update_chunks_with_embeddings(chunks, temp_embeddings, i)
-                print("Chunk", i, "out of", len(chunks) / EMBED_CHUNK_SIZE)
+                print(
+                    "Chunk",
+                    i / EMBED_CHUNK_SIZE,
+                    "out of",
+                    len(chunks) / EMBED_CHUNK_SIZE,
+                )
 
             chunks_path.parent.mkdir(parents=True, exist_ok=True)
 
             with chunks_path.open("wb") as f:
                 pickle.dump(chunks, f)
-        print(len(chunks), len(chunks[0].embedding))
+
+        embedded_questions = embed_texts(questions)
+
+        scores_per_question = []
+        for i, question in enumerate(embedded_questions):
+            scores_per_question.append([])
+            for chunk in chunks:
+                scores_per_question[i].append(np.dot(question, chunk.embedding))
+
+        top_fives = []
+        for result in scores_per_question:
+            top_fives.append(np.argsort(np.array(result))[::-1][:5])
+
+        for i, top_five in enumerate(top_fives):
+            print("Question:", questions[i])
+            for answer_index in top_five:
+                print("Score:", scores_per_question[i][answer_index])
+                print("Answer:", chunks[answer_index].text)
+
+        separator = "\n\n---\n\n"
+        for i, question in enumerate(questions):
+            five_joined = ""
+            for top_five in top_fives[i]:
+                five_joined += chunks[top_five].text + separator
+            text = complete(
+                "Based on this question '"
+                + question
+                + "'"
+                + "using only the context that I'll send you, find answer to the question. If the answer is not there, tell so. Context:'"
+                + five_joined
+                + "'."
+            )
+            print("response:", text)
+
     finally:
         client.close()
